@@ -1,0 +1,478 @@
+---
+title: API Priority and Fairness
+content_type: concept
+min-kubernetes-server-version: v1.18
+---
+
+<!-- overview -->
+
+{{< feature-state state="beta"  for_k8s_version="v1.20" >}}
+
+Контроль за поведением API-сервера Kubernetes в условиях высокой нагрузки — ключевая задача для администраторов кластера. В {{< glossary_tooltip term_id="kube-apiserver" text="kube-apiserver">}} имеются некоторые механизмы управления (например, флаги командной строки `--max-requests-inflight` и `--max-mutating-requests-inflight`) для ограничения нагрузки на сервер. Они предотвращают наплыв входящих запросов и потенциальный отказ сервера API, но не позволяют гарантировать прохождение наиболее важных запросов в периоды высокой нагрузки.
+
+Функция регулирования приоритета и обеспечения равнодоступности API Priority and Fairness (APF) — отличная  альтернатива для флагов, которая оптимизирует вышеупомянутые ограничения на максимальное количество запросов. APF более тщательно классифицирует запросы и изолирует их. Также она поддерживает механизм очередей, который помогает обрабатывать запросы при краткосрочных всплесках нагрузки. Отправка запросов из очередей осуществляется на основе метода организации равноправных очередей, поэтому плохо работающий {{< glossary_tooltip text="контроллер" term_id="controller" >}} не будет мешать работе других (даже с аналогичным уровнем приоритета).
+
+Эта функция предназначена для корректной работы со стандартными контроллерами, которые используют информеры и реагируют на неудачные API-запросы, экспоненциально увеличивая выдержку между ними, а также клиентами, устроенными аналогичным образом.
+
+{{< caution >}}
+Запросы, отнесенные к категории "long-running" — в первую очередь следящие — не подпадают под действие фильтра API Priority and Fairness. Это также верно для флага `--max-requests-inflight` без включенной функции API Priority and Fairness.
+{{< /caution >}}
+
+<!-- body -->
+
+## Включение/отключение API Priority and Fairness
+
+Управление API Priority and Fairness осуществляется с помощью функционального шлюза (feature gate); по умолчанию функция включена. В разделе [Функциональные шлюзы](/docs/reference/command-line-tools-reference/feature-gates/) приведено их общее описание и способы включения/отключения. В случае APF соответствующий шлюз называется "APIPriorityAndFairness". Данная функция также включает {{< glossary_tooltip term_id="api-group" text="группу API" >}}, при этом: (a) версия `v1alpha1` по умолчанию отключена, (b) версии `v1beta1` и `v1beta2` по умолчанию включены. Чтобы отключить APF и бета-версии групп API, добавьте следующие флаги командной строки в вызов `kube-apiserver`:
+
+```shell
+kube-apiserver \
+--feature-gates=APIPriorityAndFairness=false \
+--runtime-config=flowcontrol.apiserver.k8s.io/v1beta1=false,flowcontrol.apiserver.k8s.io/v1beta2=false \
+ # …и остальные флаги, как обычно
+```
+
+Кроме того, версию v1alpha1 группы API можно включить с помощью `--runtime-config=flowcontrol.apiserver.k8s.io/v1alpha1=true`.
+
+Флаг командной строки `--enable-priority-and-fairness=false` отключит функцию API Priority and Fairness, даже если другие флаги ее активировали.
+
+## Основные понятия
+
+Функция API Priority and Fairness в своей работе использует несколько базовых понятий/механизмов. Входящие запросы классифицируются по атрибутам с помощью т.н. _FlowSchemas_, после чего им присваиваются уровни приоритета. Уровни приоритета обеспечивают некоторую степень изоляции, обеспечивая различные пределы параллелизма, предотвращая влияние запросов с разными уровнями приоритета друг на друга. В пределах одного приоритета алгоритм равнодоступного формирования очереди предотвращает взаимное влияние запросов из разных _потоков_ и формирует очередь запросов, снижая число неудачных запросов во время всплесков трафика при приемлемо низкой средней нагрузке.
+
+### Уровни приоритета
+
+Без включенного APF управление общим параллелизмом в API-сервере осуществляется флагами `--max-requests-inflight` и `--max-mutating-requests-inflight` `kube-apiserver`'а. При включенном APF пределы параллелизма, заданные этими флагами, суммируются, а затем сумма распределяется по настраиваемому набору _уровней приоритета_. Каждому входящему запросу присваивается определенный уровень приоритета, причем каждый уровень приоритета может отправлять только такое количество параллельных запросов, которое прописано в его конфигурации.
+
+Конфигурация по умолчанию, например, предусматривает отдельные уровни приоритета для запросов на выборы лидера, запросов от встроенных контроллеров и запросов от Pod'ов. Это означает, что Pod, ведущий себя некорректно и переполняющий API-сервер запросами, не сможет помешать выборам лидера или оказать влияние на действия встроенных контроллеров.
+
+### Очереди
+
+Каждый уровень приоритета может включать большое количество различных источников трафика. Во время перегрузки важно предотвратить негативное влияние одного потока запросов на остальные (например, в идеале один сбойный клиент, переполняющий kube-apiserver своими запросами, не должен оказывать заметного влияния на других клиентов). Для этого при обработке запросов с одинаковым уровнем приоритета используется алгоритм равнодоступной очереди. Каждый запрос приписывается к _потоку_, который идентифицируется по имени соответствующей FlowSchema и _дифференциатор потока_ — пользователь-источник запроса, пространство имен целевого ресурса, либо ничего. Система старается придать примерно равный вес запросам в разных потоках с одинаковым уровнем приоритета. 
+Для раздельной обработки различных инстансов контроллеры с большим их числом должны аутентифицироваться под разными именами пользователей.
+
+Распределив запрос в некоторый поток, функция API Priority and Fairness затем приписывает его к очереди. Этот процесс базируется на методе, известном как {{< glossary_tooltip term_id="shuffle-sharding" text="shuffle sharding" >}} (перетасовка между шардами), который относительно эффективно изолирует потоки низкой интенсивности от потоков высокой интенсивности с помощью очередей.
+
+Параметры алгоритма постановки в очередь можно настраивать для каждого уровня приоритетов. В результате администратор может выбирать между использованием памяти, равнодоступностью (свойством, которое обеспечивает продвижение независимых потоков, когда совокупный трафик превышает пропускную способность), толерантностью к всплескам трафика и дополнительной задержкой, вызванной постановкой в очередь.
+
+### Запросы-исключения
+
+Некоторые запросы считаются настолько важными, что на них не распространяется ни одно из ограничений, налагаемых этой функцией. Механизм исключений не позволяет ошибочно настроенной конфигурации управления потоком полностью вывести сервер API из строя.
+
+## Ресурсы
+
+API управления потоками включает в себя два вида ресурсов. [PriorityLevelConfigurations](/docs/reference/generated/kubernetes-api/{{< param "version" >}}/#prioritylevelconfiguration-v1beta2-flowcontrol-apiserver-k8s-io) определяет доступные классы изоляции, долю доступного бюджета параллелизма, которая выделяется для каждого класса, и позволяет выполнять тонкую настройку работы с очередями. [FlowSchema](/docs/reference/generated/kubernetes-api/{{< param "version" >}}/#flowschema-v1beta2-flowcontrol-apiserver-k8s-io) используется для классификации отдельных входящих запросов, сопоставляя каждый из них с одной из конфигураций PriorityLevelConfiguration. Кроме того, существует версия `v1alpha1` данной группы API, с аналогичными Kinds с теми же синтаксисом и семантикой.
+
+### PriorityLevelConfiguration
+
+PriorityLevelConfiguration представляет отдельный класс изоляции. У каждой конфигурации PriorityLevelConfiguration имеется независимый предел на количество активных запросов и ограничения на число запросов в очереди.
+
+Пределы параллелизма для PriorityLevelConfigurations указываются не в виде абсолютного количества запросов, а в виде "долей параллелизма" (concurrency shares). Совокупный объем ресурсов API-сервера, доступных для параллелизма, распределяется между существующими PriorityLevelConfigurations пропорционально этим долям. Администратор кластера может увеличить или уменьшить совокупный объем трафика на сервер, просто перезапустив kube-apiserver с другим значением `--max-requests-inflight` (или `--max-mutating-requests-inflight`). В результате пропускная способность каждой PriorityLevelConfigurations возрастет (или снизится) соразмерно ее доле.
+
+{{< caution >}}
+При включенной функции Priority and Fairness суммарный предел параллелизма для сервера равен сумме `--max-requests-inflight` и `--max-mutating-requests-inflight`. При этом мутирующие и не мутирующие запросы рассматриваются вместе; чтобы обрабатывать их независимо для некоторого ресурса, создайте отдельные FlowSchemas для мутирующих и не мутирующих действий (verbs).
+{{< /caution >}}
+
+Поле `type` спецификации PriorityLevelConfiguration определяет судьбу избыточных запросов, когда их объем, отнесенный к одной PriorityLevelConfiguration, превышает ее допустимый уровень параллелизма. Тип `Reject` означает, что избыточный трафик будет немедленно отклонен с ошибкой HTTP 429 (Too Many Requests). Тип `Queue` означает, что запросы, превышающие пороговое значение, будут поставлены в очередь, при этом для балансировки прогресса между потоками запросов будут использоваться методы shuffle sharding и равноправных очередей.
+
+Конфигурация очередей позволяет настроить алгоритм равноправных очередей для каждого уровня приоритета. Подробности об алгоритме можно узнать из [предложения по улучшению](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/1040-priority-and-fairness); если вкратце:
+
+* Увеличение `queues` снижает количество конфликтов между различными потоками за счет повышенного использования памяти. При единице логика равнодоступной очереди отключается, но запросы все равно могут быть поставлены в очередь.
+
+* Увеличение длины очереди (`queueLengthLimit`) позволяет выдерживать большие всплески трафика без потери запросов за счет увеличения задержек и повышенного потребления памяти.
+
+* Изменение `handSize` позволяет регулировать вероятность конфликтов между различными потоками и общий параллелизм, доступный для одного потока в условиях чрезмерной нагрузки.
+
+  {{< note >}}
+  Больший `handSize` снижает вероятность конфликта двух отдельных потоков (и, следовательно, вероятность того, что один из них подавит другой), но повышает вероятность того, что малое число потоков загрузят API-сервер. Больший `handSize` также потенциально увеличивает задержку, которую может вызвать один поток с высоким трафиком. Максимальное возможное количество запросов в очереди от одного потока равно `handSize * queueLengthLimit`.
+  {{< /note >}}
+
+Ниже приведена таблица с различными конфигурациями shuffle sharding, показывающая вероятность того, что "мышь" (поток низкой интенсивности) будет раздавлена "слонами" (потоками высокой интенсивности) в зависимости от числа "слонов". Скрипт для расчета таблицы доступен по [ссылке](https://play.golang.org/p/Gi0PLgVHiUg).
+
+{{< table caption = "Конфигурации shuffle sharding" >}}
+HandSize | Число очередей | 1 слон | 4 слона | 16 слонов
+|----------|-----------|------------|----------------|--------------------|
+| 12 | 32 | 4.428838398950118e-09 | 0.11431348830099144 | 0.9935089607656024 |
+| 10 | 32 | 1.550093439632541e-08 | 0.0626479840223545 | 0.9753101519027554 |
+| 10 | 64 | 6.601827268370426e-12 | 0.00045571320990370776 | 0.49999929150089345 |
+| 9 | 64 | 3.6310049976037345e-11 | 0.00045501212304112273 | 0.4282314876454858 |
+| 8 | 64 | 2.25929199850899e-10 | 0.0004886697053040446 | 0.35935114681123076 |
+| 8 | 128 | 6.994461389026097e-13 | 3.4055790161620863e-06 | 0.02746173137155063 |
+| 7 | 128 | 1.0579122850901972e-11 | 6.960839379258192e-06 | 0.02406157386340147 |
+| 7 | 256 | 7.597695465552631e-14 | 6.728547142019406e-08 | 0.0006709661542533682 |
+| 6 | 256 | 2.7134626662687968e-12 | 2.9516464018476436e-07 | 0.0008895654642000348 |
+| 6 | 512 | 4.116062922897309e-14 | 4.982983350480894e-09 | 2.26025764343413e-05 |
+| 6 | 1024 | 6.337324016514285e-16 | 8.09060164312957e-11 | 4.517408062903668e-07 |
+{{< /table >}}
+
+### FlowSchema
+
+FlowSchema сопоставляется со входящими запросами; по результатам данного действия тем приписывается определенный уровень приоритета. Каждый входящий запрос по очереди проверяется на соответствие каждой FlowSchema, начиная с тех, у которых наименьшее численное значение `matchingPrecedence` (т.е., логически наивысший приоритет). Проверка ведется до первого совпадения.
+
+{{< caution >}}
+Учитывается только первая подходящая FlowSchema для данного запроса. Если одному входящему запросу соответствует несколько FlowSchemas, он попадет в ту, у которой наивысший `matchingPrecedence`. Если несколько FlowSchema с одинаковым `matchingPrecedence` соответствуют одному запросу, предпочтение будет отдано той, у которой лексикографически меньшее имя (`name`). Впрочем, лучше не полагаться на это, а убедиться, что `matchingPrecedence` уникален для всех FlowSchema.
+{{< /caution >}}
+
+Схема FlowSchema подходит определенному запросу, если хотя бы одно из ее правил (`rules`) подходит ему. В свою очередь, правило соответствует запросу, если ему соответствует хотя бы один из его субъектов (`subjects`) *и* хотя бы одно из его правил `resourceRules` или `nonResourceRules` (в зависимости от того, является ли входящий запрос ресурсным или нересурсным URL).
+
+Для поля `name` в субъектах (subjects) и полей `verbs`, `apiGroups`, `resources`, `namespaces` и `nonResourceURLs` в ресурсных и нересурсных правилах может быть указан универсальный символ `*`, который будет соответствовать всем значениям для данного поля, фактически исключая его из рассмотрения.
+
+Параметр `distinguisherMethod.type` схемы FlowSchema определяет, как запросы, соответствующие этой схеме, будут разделяться на потоки. Он может быть либо `ByUser` (в этом случае один запрашивающий пользователь не сможет лишить других пользователей ресурсов), либо `ByNamespace` (в этом случае запросы на ресурсы в одном пространстве имен не смогут помешать запросам на ресурсы в других пространствах имен), либо он может быть пустым (или `distinguisherMethod` может быть опущен) (в этом случае все запросы, соответствующие данной FlowSchema, будут считаться частью одного потока). Правильный выбор для определенной FlowSchema зависит от ресурса и конкретной среды.
+
+## Значения по умолчанию
+
+kube-apiserver поддерживает два вида объектов конфигурации APF: обязательные и рекомендуемые.
+
+### Обязательные объекты конфигурации
+
+Четыре обязательных объекта конфигурации отражают защитное поведение, встроенное в серверы. Оно реализуется независимо от этих объектов; параметры последних просто его отражают.
+
+* Обязательный уровень приоритета `exempt` используется для запросов, которые вообще не подчиняются контролю потока: они всегда будут доставляться немедленно. Обязательная FlowSchema `exempt` относит к этому уровню приоритета все запросы из группы `system:masters`. При необходимости можно задать другие FlowSchemas, которые будут наделять другие запросы данным уровнем приоритета.
+
+* Обязательный уровень приоритета `catch-all` используется в сочетании с обязательной FlowSchema `catch-all`, гарантируя, что каждый запрос получит какую-либо классификацию. Как правило, полагаться на эту универсальную конфигурацию не следует. Рекомендуется создать свои собственные универсальные FlowSchema и PriorityLevelConfiguration (или использовать опциональный уровень приоритета `global-default`, доступный по умолчанию). Поскольку предполагается, что обязательный уровень приоритета `catch-all` будет использоваться редко, его доля параллелизма невысока, кроме того, он не ставит запросы в очередь.
+
+### Опциональные объекты конфигурации
+
+Опциональные объекты FlowSchemas и PriorityLevelConfigurations образуют оптимальную конфигурацию по умолчанию. При желании их можно изменить и/или создать дополнительные объекты конфигурации. Если велика вероятность высокой нагрузки на кластер, следует решить, какая конфигурация будет работать лучше всего.
+
+Опциональная конфигурация группирует запросы по шести уровням приоритета:
+
+* Уровень приоритета `node-high` предназначен для проверки здоровья узлов.
+
+* Уровень приоритета `system` предназначен для запросов от группы `system:nodes`, не связанных с состоянием узлов, а именно, от kubelet'ов которые должны иметь возможность связываться с сервером API для планирования рабочих нагрузок.
+
+* Уровень приоритета `leader-election` предназначен для запросов на выборы лидера от встроенных контроллеров (в частности, запросы на объекты типа `Endpoint`, `ConfigMap` или `Lease`, поступающие от пользователей `system:kube-controller-manager` или `system:kube-scheduler` и служебных учетных записей в пространстве имен `kube-system`). Их важно изолировать от другого трафика, поскольку сбои при выборе лидеров приводят к перезагрузкам контроллеров. Соответственно, новые контроллеры потребляют трафик, синхронизируя свои информеры.
+
+* Уровень приоритета `workload-high` предназначен для прочих запросов от встроенных контроллеров.
+
+* Уровень приоритета `workload-low` предназначен для запросов от остальных учетных записей служб, которые обычно включают все запросы от контроллеров, работающих в Pod'ах.
+
+* Уровень приоритета `global-default` обрабатывает весь остальной трафик, например, интерактивные команды `kubectl`, выполняемые непривилегированными пользователями.
+
+Опциональные FlowSchemas служат для направления запросов на вышеуказанные уровни приоритета и здесь не перечисляются.
+
+### Обслуживание обязательных и опциональных объектов конфигурации
+
+Каждый `kube-apiserver` самостоятельно обслуживает обязательные и опциональные объекты конфигурации, используя стратегию начальных/периодических проходов. Таким образом, в ситуации с серверами разных версий может возникнуть пробуксовка (thrashing) из-за разного представления серверов о правильном содержании этих объектов.
+
+Каждый `kube-apiserver` выполняет начальный проход по обязательным и опциональным объектам конфигурации, а затем периодически (раз в минуту) обходит их.
+
+Для обязательных объектов обслуживание заключается в проверке того, что объект существует и имеет надлежащую спецификацию (spec). Сервер не разрешает создавать или обновлять объекты со spec, которая не соответствует его защитному поведению.
+
+Обслуживание опциональных объектов конфигурации предусматривает возможность переопределения их спецификации (spec). Кроме того, удаление носит непостоянный характер: объект будет восстановлен в процессе обслуживания. Если опциональный объект конфигурации не нужен, его не нужно удалять, но достаточно настроить spec'и так, чтобы последствия были минимальными. Обслуживание опциональных объектов также рассчитано на поддержку автоматической миграции при выходе новой версии `kube-apiserver`, при этом вероятны конфликты (thrashing) пока группировка серверов остается смешанной.
+
+Обслуживание опционального объекта конфигурации предусматривает его создание — с рекомендуемой спецификацией сервера — если тот не существует. В то же время, если объект уже существует, поведение при обслуживании зависит от того, кто им управляет — `kube-apiserver`'ы или пользователи. В первом случае сервер гарантирует, что спецификация объекта соответствует рекомендуемой; во втором случае спецификация не анализируется.
+
+Чтобы узнать, кто управляет объектом, необходимо найти аннотацию с ключом `apf.kubernetes.io/autoupdate-spec`. Если такая аннотация существует и ее значение равно `true`, то объект контролируется kube-apiserver'ами. Если аннотация существует и ее значение равно `false`, объект контролируется пользователями. Если ни одно из этих условий не выполняется, выполняется обращение к `metadata.generation` объекта. Если этот параметр равен 1, объект контролируется kube-apiserver'ами. В противном случае объект контролируют пользователи. Эти правила были введены в версии 1.22, и использование `metadata.generation` обусловлено переходом от более простого предыдущего поведения. Пользователи, желающие контролировать опциональный объект конфигурации, должны убедиться, что его аннотация `apf.kubernetes.io/autoupdate-spec` имеет значение false.
+
+Обслуживание обязательного или опционального объекта конфигурации также предусматривает проверку наличия у него аннотации `apf.kubernetes.io/autoupdate-spec`, которая позволяет понять, контролируют ли его kube-apiserver'ы.
+
+Обслуживание также предусматривает удаление объектов, которые не являются ни обязательными, ни опциональными, но имеют аннотацию `apf.kubernetes.io/autoupdate-spec=true`.
+
+## Освобождение от параллелизма проверок работоспособности
+
+The suggested configuration gives no special treatment to the health
+check requests on kube-apiservers from their local kubelets --- which
+tend to use the secured port but supply no credentials.  With the
+suggested config, these requests get assigned to the `global-default`
+FlowSchema and the corresponding `global-default` priority level,
+where other traffic can crowd them out.
+
+If you add the following additional FlowSchema, this exempts those
+requests from rate limiting.
+
+{{< caution >}}
+Making this change also allows any hostile party to then send
+health-check requests that match this FlowSchema, at any volume they
+like.  If you have a web traffic filter or similar external security
+mechanism to protect your cluster's API server from general internet
+traffic, you can configure rules to block any health check requests
+that originate from outside your cluster.
+{{< /caution >}}
+
+{{< codenew file="priority-and-fairness/health-for-strangers.yaml" >}}
+
+## Diagnostics
+
+Every HTTP response from an API server with the priority and fairness feature
+enabled has two extra headers: `X-Kubernetes-PF-FlowSchema-UID` and
+`X-Kubernetes-PF-PriorityLevel-UID`, noting the flow schema that matched the request
+and the priority level to which it was assigned, respectively. The API objects'
+names are not included in these headers in case the requesting user does not
+have permission to view them, so when debugging you can use a command like
+
+```shell
+kubectl get flowschemas -o custom-columns="uid:{metadata.uid},name:{metadata.name}"
+kubectl get prioritylevelconfigurations -o custom-columns="uid:{metadata.uid},name:{metadata.name}"
+```
+
+to get a mapping of UIDs to names for both FlowSchemas and
+PriorityLevelConfigurations.
+
+## Observability
+
+### Metrics
+
+{{< note >}}
+In versions of Kubernetes before v1.20, the labels `flow_schema` and
+`priority_level` were inconsistently named `flowSchema` and `priorityLevel`,
+respectively. If you're running Kubernetes versions v1.19 and earlier, you
+should refer to the documentation for your version.
+{{< /note >}}
+
+When you enable the API Priority and Fairness feature, the kube-apiserver
+exports additional metrics. Monitoring these can help you determine whether your
+configuration is inappropriately throttling important traffic, or find
+poorly-behaved workloads that may be harming system health.
+
+* `apiserver_flowcontrol_rejected_requests_total` is a counter vector
+  (cumulative since server start) of requests that were rejected,
+  broken down by the labels `flow_schema` (indicating the one that
+  matched the request), `priority_level` (indicating the one to which
+  the request was assigned), and `reason`.  The `reason` label will be
+  have one of the following values:
+
+  * `queue-full`, indicating that too many requests were already
+    queued,
+  * `concurrency-limit`, indicating that the
+    PriorityLevelConfiguration is configured to reject rather than
+    queue excess requests, or
+  * `time-out`, indicating that the request was still in the queue
+    when its queuing time limit expired.
+
+* `apiserver_flowcontrol_dispatched_requests_total` is a counter
+  vector (cumulative since server start) of requests that began
+  executing, broken down by the labels `flow_schema` (indicating the
+  one that matched the request) and `priority_level` (indicating the
+  one to which the request was assigned).
+
+* `apiserver_current_inqueue_requests` is a gauge vector of recent
+  high water marks of the number of queued requests, grouped by a
+  label named `request_kind` whose value is `mutating` or `readOnly`.
+  These high water marks describe the largest number seen in the one
+  second window most recently completed.  These complement the older
+  `apiserver_current_inflight_requests` gauge vector that holds the
+  last window's high water mark of number of requests actively being
+  served.
+
+* `apiserver_flowcontrol_read_vs_write_request_count_samples` is a
+  histogram vector of observations of the then-current number of
+  requests, broken down by the labels `phase` (which takes on the
+  values `waiting` and `executing`) and `request_kind` (which takes on
+  the values `mutating` and `readOnly`).  The observations are made
+  periodically at a high rate.  Each observed value is a ratio,
+  between 0 and 1, of a number of requests divided by the
+  corresponding limit on the number of requests (queue length limit
+  for waiting and concurrency limit for executing).
+
+* `apiserver_flowcontrol_read_vs_write_request_count_watermarks` is a
+  histogram vector of high or low water marks of the number of
+  requests (divided by the corresponding limit to get a ratio in the
+  range 0 to 1) broken down by the labels `phase` (which takes on the
+  values `waiting` and `executing`) and `request_kind` (which takes on
+  the values `mutating` and `readOnly`); the label `mark` takes on
+  values `high` and `low`.  The water marks are accumulated over
+  windows bounded by the times when an observation was added to
+  `apiserver_flowcontrol_read_vs_write_request_count_samples`.  These
+  water marks show the range of values that occurred between samples.
+
+* `apiserver_flowcontrol_current_inqueue_requests` is a gauge vector
+  holding the instantaneous number of queued (not executing) requests,
+  broken down by the labels `priority_level` and `flow_schema`.
+
+* `apiserver_flowcontrol_current_executing_requests` is a gauge vector
+  holding the instantaneous number of executing (not waiting in a
+  queue) requests, broken down by the labels `priority_level` and
+  `flow_schema`.
+
+* `apiserver_flowcontrol_request_concurrency_in_use` is a gauge vector
+  holding the instantaneous number of occupied seats, broken down by
+  the labels `priority_level` and `flow_schema`.
+
+* `apiserver_flowcontrol_priority_level_request_count_samples` is a
+  histogram vector of observations of the then-current number of
+  requests broken down by the labels `phase` (which takes on the
+  values `waiting` and `executing`) and `priority_level`.  Each
+  histogram gets observations taken periodically, up through the last
+  activity of the relevant sort.  The observations are made at a high
+  rate.  Each observed value is a ratio, between 0 and 1, of a number
+  of requests divided by the corresponding limit on the number of
+  requests (queue length limit for waiting and concurrency limit for
+  executing).
+
+* `apiserver_flowcontrol_priority_level_request_count_watermarks` is a
+  histogram vector of high or low water marks of the number of
+  requests (divided by the corresponding limit to get a ratio in the
+  range 0 to 1) broken down by the labels `phase` (which takes on the
+  values `waiting` and `executing`) and `priority_level`; the label
+  `mark` takes on values `high` and `low`.  The water marks are
+  accumulated over windows bounded by the times when an observation
+  was added to
+  `apiserver_flowcontrol_priority_level_request_count_samples`.  These
+  water marks show the range of values that occurred between samples.
+
+* `apiserver_flowcontrol_priority_level_seat_count_samples` is a
+  histogram vector of observations of the utilization of a priority
+  level's concurrency limit, broken down by `priority_level`.  This
+  utilization is the fraction (number of seats occupied) /
+  (concurrency limit).  This metric considers all stages of execution
+  (both normal and the extra delay at the end of a write to cover for
+  the corresponding notification work) of all requests except WATCHes;
+  for those it considers only the initial stage that delivers
+  notifications of pre-existing objects.  Each histogram in the vector
+  is also labeled with `phase: executing` (there is no seat limit for
+  the waiting phase).  Each histogram gets observations taken
+  periodically, up through the last activity of the relevant sort.
+  The observations
+  are made at a high rate.  
+
+* `apiserver_flowcontrol_priority_level_seat_count_watermarks` is a
+  histogram vector of high or low water marks of the utilization of a
+  priority level's concurrency limit, broken down by `priority_level`
+  and `mark` (which takes on values `high` and `low`).  Each histogram
+  in the vector is also labeled with `phase: executing` (there is no
+  seat limit for the waiting phase).  The water marks are accumulated
+  over windows bounded by the times when an observation was added to
+  `apiserver_flowcontrol_priority_level_seat_count_samples`.  These
+  water marks show the range of values that occurred between samples.
+
+* `apiserver_flowcontrol_request_queue_length_after_enqueue` is a
+  histogram vector of queue lengths for the queues, broken down by
+  the labels `priority_level` and `flow_schema`, as sampled by the
+  enqueued requests.  Each request that gets queued contributes one
+  sample to its histogram, reporting the length of the queue immediately
+  after the request was added.  Note that this produces different
+  statistics than an unbiased survey would.
+
+  {{< note >}}
+  An outlier value in a histogram here means it is likely that a single flow
+  (i.e., requests by one user or for one namespace, depending on
+  configuration) is flooding the API server, and being throttled. By contrast,
+  if one priority level's histogram shows that all queues for that priority
+  level are longer than those for other priority levels, it may be appropriate
+  to increase that PriorityLevelConfiguration's concurrency shares.
+  {{< /note >}}
+
+* `apiserver_flowcontrol_request_concurrency_limit` is a gauge vector
+  holding the computed concurrency limit (based on the API server's
+  total concurrency limit and PriorityLevelConfigurations' concurrency
+  shares), broken down by the label `priority_level`.
+
+* `apiserver_flowcontrol_request_wait_duration_seconds` is a histogram
+  vector of how long requests spent queued, broken down by the labels
+  `flow_schema` (indicating which one matched the request),
+  `priority_level` (indicating the one to which the request was
+  assigned), and `execute` (indicating whether the request started
+  executing).
+
+  {{< note >}}
+  Since each FlowSchema always assigns requests to a single
+  PriorityLevelConfiguration, you can add the histograms for all the
+  FlowSchemas for one priority level to get the effective histogram for
+  requests assigned to that priority level.
+  {{< /note >}}
+
+* `apiserver_flowcontrol_request_execution_seconds` is a histogram
+  vector of how long requests took to actually execute, broken down by
+  the labels `flow_schema` (indicating which one matched the request)
+  and `priority_level` (indicating the one to which the request was
+  assigned).
+
+* `apiserver_flowcontrol_watch_count_samples` is a histogram vector of
+  the number of active WATCH requests relevant to a given write,
+  broken down by `flow_schema` and `priority_level`.
+
+* `apiserver_flowcontrol_work_estimated_seats` is a histogram vector
+  of the number of estimated seats (maximum of initial and final stage
+  of execution) associated with requests, broken down by `flow_schema`
+  and `priority_level`.
+
+* `apiserver_flowcontrol_request_dispatch_no_accommodation_total` is a
+  counter vec of the number of events that in principle could have led
+  to a request being dispatched but did not, due to lack of available
+  concurrency, broken down by `flow_schema` and `priority_level`.  The
+  relevant sorts of events are arrival of a request and completion of
+  a request.
+
+### Debug endpoints
+
+When you enable the API Priority and Fairness feature, the `kube-apiserver`
+serves the following additional paths at its HTTP[S] ports.
+
+- `/debug/api_priority_and_fairness/dump_priority_levels` - a listing of
+  all the priority levels and the current state of each.  You can fetch like this:
+
+  ```shell
+  kubectl get --raw /debug/api_priority_and_fairness/dump_priority_levels
+  ```
+
+  The output is similar to this:
+
+  ```none
+  PriorityLevelName, ActiveQueues, IsIdle, IsQuiescing, WaitingRequests, ExecutingRequests,
+  workload-low,      0,            true,   false,       0,               0,
+  global-default,    0,            true,   false,       0,               0,
+  exempt,            <none>,       <none>, <none>,      <none>,          <none>,
+  catch-all,         0,            true,   false,       0,               0,
+  system,            0,            true,   false,       0,               0,
+  leader-election,   0,            true,   false,       0,               0,
+  workload-high,     0,            true,   false,       0,               0,
+  ```
+
+- `/debug/api_priority_and_fairness/dump_queues` - a listing of all the
+  queues and their current state.  You can fetch like this:
+
+  ```shell
+  kubectl get --raw /debug/api_priority_and_fairness/dump_queues
+  ```
+
+  The output is similar to this:
+
+  ```none
+  PriorityLevelName, Index,  PendingRequests, ExecutingRequests, VirtualStart,
+  workload-high,     0,      0,               0,                 0.0000,
+  workload-high,     1,      0,               0,                 0.0000,
+  workload-high,     2,      0,               0,                 0.0000,
+  ...
+  leader-election,   14,     0,               0,                 0.0000,
+  leader-election,   15,     0,               0,                 0.0000,
+  ```
+
+- `/debug/api_priority_and_fairness/dump_requests` - a listing of all the requests
+  that are currently waiting in a queue.  You can fetch like this:
+
+  ```shell
+  kubectl get --raw /debug/api_priority_and_fairness/dump_requests
+  ```
+
+  The output is similar to this:
+
+  ```none
+  PriorityLevelName, FlowSchemaName, QueueIndex, RequestIndexInQueue, FlowDistingsher,       ArriveTime,
+  exempt,            <none>,         <none>,     <none>,              <none>,                <none>,
+  system,            system-nodes,   12,         0,                   system:node:127.0.0.1, 2020-07-23T15:26:57.179170694Z,
+  ```
+  
+  In addition to the queued requests, the output includes one phantom line
+  for each priority level that is exempt from limitation.
+
+  You can get a more detailed listing with a command like this:
+
+  ```shell
+  kubectl get --raw '/debug/api_priority_and_fairness/dump_requests?includeRequestDetails=1'
+  ```
+
+  The output is similar to this:
+
+  ```none
+  PriorityLevelName, FlowSchemaName, QueueIndex, RequestIndexInQueue, FlowDistingsher,       ArriveTime,                     UserName,              Verb,   APIPath,                                                     Namespace, Name,   APIVersion, Resource, SubResource,
+  system,            system-nodes,   12,         0,                   system:node:127.0.0.1, 2020-07-23T15:31:03.583823404Z, system:node:127.0.0.1, create, /api/v1/namespaces/scaletest/configmaps,
+  system,            system-nodes,   12,         1,                   system:node:127.0.0.1, 2020-07-23T15:31:03.594555947Z, system:node:127.0.0.1, create, /api/v1/namespaces/scaletest/configmaps,
+  ```
+  
+## {{% heading "whatsnext" %}}
+
+
+For background information on design details for API priority and fairness, see
+the [enhancement proposal](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/1040-priority-and-fairness).
+You can make suggestions and feature requests via [SIG API Machinery](https://github.com/kubernetes/community/tree/master/sig-api-machinery) 
+or the feature's [slack channel](https://kubernetes.slack.com/messages/api-priority-and-fairness).
