@@ -168,244 +168,102 @@ kube-apiserver поддерживает два вида объектов кон�
 
 Обслуживание также предусматривает удаление объектов, которые не являются ни обязательными, ни опциональными, но имеют аннотацию `apf.kubernetes.io/autoupdate-spec=true`.
 
-## Освобождение от параллелизма проверок работоспособности
+## Освобождение проверок работоспособности от параллелизма
 
-The suggested configuration gives no special treatment to the health
-check requests on kube-apiservers from their local kubelets --- which
-tend to use the secured port but supply no credentials.  With the
-suggested config, these requests get assigned to the `global-default`
-FlowSchema and the corresponding `global-default` priority level,
-where other traffic can crowd them out.
+Опциональная конфигурация не предусматривает особого отношения к health check-запросам на kube-apiserver'ы от их локальных kubelet'ов. В данном случае обычно используется защищенный порт, но учетные данные не передаются. В опциональной конфигурации такие запросы относятся к FlowSchema `global-default` и соответствующему уровню приоритета `global-default`, где другой трафик может мешать их прохождению.
 
-If you add the following additional FlowSchema, this exempts those
-requests from rate limiting.
+Чтобы освободить такие запросы от частотных ограничений, можно добавить FlowSchema, приведенную ниже.
 
 {{< caution >}}
-Making this change also allows any hostile party to then send
-health-check requests that match this FlowSchema, at any volume they
-like.  If you have a web traffic filter or similar external security
-mechanism to protect your cluster's API server from general internet
-traffic, you can configure rules to block any health check requests
-that originate from outside your cluster.
+Добавление данной FlowSchema позволит злоумышленникам отправлять удовлетворяющие ей health-check-запросы в любом количестве. При наличии фильтра веб-трафика или аналогичного внешнего механизма безопасности для защиты API-сервера кластера от интернет-трафика можно настроить правила для блокировки любых health-check-запросов, поступающих из-за пределов кластера.
 {{< /caution >}}
 
 {{< codenew file="priority-and-fairness/health-for-strangers.yaml" >}}
 
-## Diagnostics
+## Диагностика
 
-Every HTTP response from an API server with the priority and fairness feature
-enabled has two extra headers: `X-Kubernetes-PF-FlowSchema-UID` and
-`X-Kubernetes-PF-PriorityLevel-UID`, noting the flow schema that matched the request
-and the priority level to which it was assigned, respectively. The API objects'
-names are not included in these headers in case the requesting user does not
-have permission to view them, so when debugging you can use a command like
+Каждый HTTP-ответ от сервера API с включенной функцией priority and fairness содержит два дополнительных заголовка: `X-Kubernetes-PF-FlowSchema-UID` и `X-Kubernetes-PF-PriorityLevel-UID`. В них указываются схема потока и уровень приоритета, соответственно. Имена объектов API не включаются в эти заголовки на случай, если запрашивающий пользователь не обладает правами на их просмотр, поэтому при отладке можно использовать команду типа
 
 ```shell
 kubectl get flowschemas -o custom-columns="uid:{metadata.uid},name:{metadata.name}"
 kubectl get prioritylevelconfigurations -o custom-columns="uid:{metadata.uid},name:{metadata.name}"
 ```
 
-to get a mapping of UIDs to names for both FlowSchemas and
-PriorityLevelConfigurations.
+чтобы привязать UID к именам для FlowSchemas и PriorityLevelConfigurations.
 
-## Observability
+## Наблюдаемость
 
-### Metrics
+### Метрики
 
 {{< note >}}
-In versions of Kubernetes before v1.20, the labels `flow_schema` and
-`priority_level` were inconsistently named `flowSchema` and `priorityLevel`,
-respectively. If you're running Kubernetes versions v1.19 and earlier, you
-should refer to the documentation for your version.
+В Kubernetes до версии v1.20 лейблы `flow_schema` и `priority_level` также могли называться `flowSchema` и `priorityLevel`, соответственно. При использовании Kubernetes v1.19 и более ранних версий обратитесь к документации для соответствующей версии.
 {{< /note >}}
 
-When you enable the API Priority and Fairness feature, the kube-apiserver
-exports additional metrics. Monitoring these can help you determine whether your
-configuration is inappropriately throttling important traffic, or find
-poorly-behaved workloads that may be harming system health.
+При включении функции API Priority and Fairness kube-apiserver начинает экспортировать дополнительные метрики. Их мониторинг помогает выявить негативное влияние (throttling) текущей конфигурации на важный трафик или найти неэффективные рабочие нагрузки, которые вредят здоровью системы.
 
-* `apiserver_flowcontrol_rejected_requests_total` is a counter vector
-  (cumulative since server start) of requests that were rejected,
-  broken down by the labels `flow_schema` (indicating the one that
-  matched the request), `priority_level` (indicating the one to which
-  the request was assigned), and `reason`.  The `reason` label will be
-  have one of the following values:
+* `apiserver_flowcontrol_rejected_requests_total` — вектор-счетчик (кумулятивный с момента запуска сервера) запросов, которые были отклонены, с разбивкой по лейблам `flow_schema` (а именно, лейблу, соответствующему запросу), `priority_level` (уровню приоритета, который был присвоен запросу) и `reason`. Лейбл
+*  `reason` будет иметь одно из следующих значений:
 
-  * `queue-full`, indicating that too many requests were already
-    queued,
-  * `concurrency-limit`, indicating that the
-    PriorityLevelConfiguration is configured to reject rather than
-    queue excess requests, or
-  * `time-out`, indicating that the request was still in the queue
-    when its queuing time limit expired.
+  * `queue-full` — в очереди уже слишком много запросов;
+  * `concurrency-limit` — PriorityLevelConfiguration настроена на отклонение, а не на постановку в очередь избыточных запросов;
+  * `time-out` — запрос все еще находился в очереди, когда истек его лимит ожидания.
 
-* `apiserver_flowcontrol_dispatched_requests_total` is a counter
-  vector (cumulative since server start) of requests that began
-  executing, broken down by the labels `flow_schema` (indicating the
-  one that matched the request) and `priority_level` (indicating the
-  one to which the request was assigned).
+* `apiserver_flowcontrol_dispatched_requests_total` — вектор-счетчик (кумулятивный с момента запуска сервера) запросов, которые начали выполняться, сгруппированный по лейблам `flow_schema` (лейблу, соответствующему запросу) и `priority_level` (уровню приоритета, который был присвоен запросу).
 
-* `apiserver_current_inqueue_requests` is a gauge vector of recent
-  high water marks of the number of queued requests, grouped by a
-  label named `request_kind` whose value is `mutating` or `readOnly`.
-  These high water marks describe the largest number seen in the one
-  second window most recently completed.  These complement the older
-  `apiserver_current_inflight_requests` gauge vector that holds the
-  last window's high water mark of number of requests actively being
-  served.
+* `apiserver_current_inqueue_requests` — вектор предыдущего максимума числа запросов в очереди, сгруппированных по лейблу `request_kind`, значение которого `mutating` или `readOnly`. Эти максимумы описывают наибольшее число, наблюдавшееся в последнем завершенном односекундном окне. Они дополняют более старый вектор `apiserver_current_inflight_requests`, который показывает максимум активно обслуживаемых запросов в последнем окне.
 
-* `apiserver_flowcontrol_read_vs_write_request_count_samples` is a
-  histogram vector of observations of the then-current number of
-  requests, broken down by the labels `phase` (which takes on the
-  values `waiting` and `executing`) and `request_kind` (which takes on
-  the values `mutating` and `readOnly`).  The observations are made
-  periodically at a high rate.  Each observed value is a ratio,
-  between 0 and 1, of a number of requests divided by the
-  corresponding limit on the number of requests (queue length limit
-  for waiting and concurrency limit for executing).
+* `apiserver_flowcontrol_read_vs_write_request_count_samples` — вектор-гистограмма наблюдений за тогда-текущим количеством запросов с разбивкой по лейблам `phase` (принимает значения `waiting` и `executing`) и `request_kind` (принимает значения `mutating` и `readOnly`). Наблюдения проводятся периодически с высокой частотой. Каждое наблюдаемое значение представляет собой число в диапазоне от 0 до 1, равное отношению числа запросов к соответствующему ограничению на их количество (ограничение длины очереди в случае ожидания и лимит параллелизма в случае выполнения).
 
-* `apiserver_flowcontrol_read_vs_write_request_count_watermarks` is a
-  histogram vector of high or low water marks of the number of
-  requests (divided by the corresponding limit to get a ratio in the
-  range 0 to 1) broken down by the labels `phase` (which takes on the
-  values `waiting` and `executing`) and `request_kind` (which takes on
-  the values `mutating` and `readOnly`); the label `mark` takes on
-  values `high` and `low`.  The water marks are accumulated over
-  windows bounded by the times when an observation was added to
-  `apiserver_flowcontrol_read_vs_write_request_count_samples`.  These
-  water marks show the range of values that occurred between samples.
+* `apiserver_flowcontrol_read_vs_write_request_count_watermarks` — вектор-гистограмма максимумов или минимумов количества запросов (число запросов, деленное на соответствующее ограничение) с разбивкой по лейблам `phase` (принимает значения `waiting` и `executing`) и `request_kind` (принимает значения `mutating` и `readOnly`); лейбл `mark` принимает значения `high` и `low`. Минимумы и максимумы собираются в окнах, ограниченных временем, когда наблюдение было добавлено в `apiserver_flowcontrol_read_vs_write_request_count_samples`. Эти экстремумы помогают определить разброс диапазона значений, наблюдавшийся в разных сэмплах.
 
-* `apiserver_flowcontrol_current_inqueue_requests` is a gauge vector
-  holding the instantaneous number of queued (not executing) requests,
-  broken down by the labels `priority_level` and `flow_schema`.
+* `apiserver_flowcontrol_current_inqueue_requests` — gauge-вектор, содержащий количество стоящих в очереди (не выполняющихся) запросов в каждый момент с разбивкой по лейблам `priority_level` и `flow_schema`. 
 
-* `apiserver_flowcontrol_current_executing_requests` is a gauge vector
-  holding the instantaneous number of executing (not waiting in a
-  queue) requests, broken down by the labels `priority_level` and
-  `flow_schema`.
+* `apiserver_flowcontrol_current_executing_requests` — gauge-вектор, содержащий количество исполняемых (не ожидающих в очереди) запросов в каждый момент с разбивкой по лейблам `priority_level` и `flow_schema`.
 
-* `apiserver_flowcontrol_request_concurrency_in_use` is a gauge vector
-  holding the instantaneous number of occupied seats, broken down by
-  the labels `priority_level` and `flow_schema`.
+* `apiserver_flowcontrol_request_concurrency_in_use` — gauge-вектор, содержащий количество занятых мест в каждый момент с разбивкой по лейблам `priority_level` и `flow_schema`.
 
-* `apiserver_flowcontrol_priority_level_request_count_samples` is a
-  histogram vector of observations of the then-current number of
-  requests broken down by the labels `phase` (which takes on the
-  values `waiting` and `executing`) and `priority_level`.  Each
-  histogram gets observations taken periodically, up through the last
-  activity of the relevant sort.  The observations are made at a high
-  rate.  Each observed value is a ratio, between 0 and 1, of a number
-  of requests divided by the corresponding limit on the number of
-  requests (queue length limit for waiting and concurrency limit for
-  executing).
+* `apiserver_flowcontrol_priority_level_request_count_samples` — вектор-гистограмма наблюдений за текущим-на-тот-момент количеством запросов с разбивкой по лейблам `phase` (принимает значения `waiting` и `executing`) и `priority_level`. Каждая гистограмма получает наблюдения, сделанные периодически, вплоть до последней активности соответствующего рода. Наблюдения проводятся с высокой частотой. Каждое наблюдаемое значение представляет собой число в диапазоне от 0 до 1, равное отношению числа запросов к соответствующему ограничению на их количество (ограничение длины очереди в случае ожидания и лимит параллелизма в случае выполнения).
 
-* `apiserver_flowcontrol_priority_level_request_count_watermarks` is a
-  histogram vector of high or low water marks of the number of
-  requests (divided by the corresponding limit to get a ratio in the
-  range 0 to 1) broken down by the labels `phase` (which takes on the
-  values `waiting` and `executing`) and `priority_level`; the label
-  `mark` takes on values `high` and `low`.  The water marks are
-  accumulated over windows bounded by the times when an observation
-  was added to
-  `apiserver_flowcontrol_priority_level_request_count_samples`.  These
-  water marks show the range of values that occurred between samples.
+* `apiserver_flowcontrol_priority_level_request_count_watermarks` — вектор-гистограмма максимумов или минимумов количества запросов с разбивкой по лейблам `phase` (принимает значения `waiting` и `executing`) и `priority_level`; лейбл `mark` принимает значения `high` и `low`. Минимумы и максимумы собираются в окнах, ограниченных временем, когда наблюдение было добавлено в `apiserver_flowcontrol_priority_level_request_count_samples`. Эти экстремумы показывают диапазон значений, наблюдавшийся в разных сэмплах.
 
-* `apiserver_flowcontrol_priority_level_seat_count_samples` is a
-  histogram vector of observations of the utilization of a priority
-  level's concurrency limit, broken down by `priority_level`.  This
-  utilization is the fraction (number of seats occupied) /
-  (concurrency limit).  This metric considers all stages of execution
-  (both normal and the extra delay at the end of a write to cover for
-  the corresponding notification work) of all requests except WATCHes;
-  for those it considers only the initial stage that delivers
-  notifications of pre-existing objects.  Each histogram in the vector
-  is also labeled with `phase: executing` (there is no seat limit for
-  the waiting phase).  Each histogram gets observations taken
-  periodically, up through the last activity of the relevant sort.
-  The observations
-  are made at a high rate.  
+* `apiserver_flowcontrol_priority_level_seat_count_samples` — вектор-гистограмма наблюдений за использованием лимита параллелизма для уровня приоритета с разбивкой по `priority_level`.  Использование — отношение (количество занятых мест) / (предел параллелизма). Метрика учитывает все стадии выполнения (как обычную, так и дополнительную задержку в конце записи для покрытия соответствующей работы по уведомлению) всех запросов, кроме WATCHes; для этих запросов учитывается только начальная стадия по доставке уведомлений о ранее существующих объектах.  Каждая гистограмма в векторе также помечена лейблом `phase: executing` (количество мест для фазы ожидания не ограничено).  Каждая гистограмма получает наблюдения, сделанные периодически, вплоть до последней активности соответствующего рода. Наблюдения производятся с высокой частотой.
 
-* `apiserver_flowcontrol_priority_level_seat_count_watermarks` is a
-  histogram vector of high or low water marks of the utilization of a
-  priority level's concurrency limit, broken down by `priority_level`
-  and `mark` (which takes on values `high` and `low`).  Each histogram
-  in the vector is also labeled with `phase: executing` (there is no
-  seat limit for the waiting phase).  The water marks are accumulated
-  over windows bounded by the times when an observation was added to
-  `apiserver_flowcontrol_priority_level_seat_count_samples`.  These
-  water marks show the range of values that occurred between samples.
+* `apiserver_flowcontrol_priority_level_seat_count_watermarks` — вектор-гистограмма минимумов и максимумов использования предела параллелизма для уровня приоритета с разбивкой по `priority_leve` и `mark` (принимает значения `high` и `low`). Каждая гистограмма в векторе также помечена лейблом `phase: executing` (для фазы ожидания предел на места отсутствует). Максимумы и минимумы собираются в окнах, ограниченных временем, когда наблюдение было добавлено в `apiserver_flowcontrol_priority_level_seat_count_samples`. Эти экстремумы помогают определить разброс диапазона значений, наблюдавшийся в разных сэмплах.
 
-* `apiserver_flowcontrol_request_queue_length_after_enqueue` is a
-  histogram vector of queue lengths for the queues, broken down by
-  the labels `priority_level` and `flow_schema`, as sampled by the
-  enqueued requests.  Each request that gets queued contributes one
-  sample to its histogram, reporting the length of the queue immediately
-  after the request was added.  Note that this produces different
-  statistics than an unbiased survey would.
+* `apiserver_flowcontrol_request_queue_length_after_enqueue` — вектор-гистограмма длины очереди для очередей с разбивкой по лейблам `priority_level` и `flow_schema` как выборки по поставленным в очередь запросам. Каждый запрос при постановке в очередь вносит один сэмпл в гистограмму, сообщая о длине очереди сразу после добавления запроса. Обратите внимание, что это дает иную статистику, чем при объективном исследовании.
 
   {{< note >}}
-  An outlier value in a histogram here means it is likely that a single flow
-  (i.e., requests by one user or for one namespace, depending on
-  configuration) is flooding the API server, and being throttled. By contrast,
-  if one priority level's histogram shows that all queues for that priority
-  level are longer than those for other priority levels, it may be appropriate
-  to increase that PriorityLevelConfiguration's concurrency shares.
+  В данном случае выброс в гистограмме означает, что, скорее всего, один поток (т.е. запросы от одного пользователя или для одного пространства имен, в зависимости от конфигурации) переполняет сервер API и "срезается" (throttled). И наоборот, если гистограмма одного уровня приоритета показывает, что все очереди для этого уровня приоритета длиннее, чем для других уровней приоритета, возможно, следует увеличить долю параллелизма для этого уровня приоритета в PriorityLevelConfiguration.
   {{< /note >}}
 
-* `apiserver_flowcontrol_request_concurrency_limit` is a gauge vector
-  holding the computed concurrency limit (based on the API server's
-  total concurrency limit and PriorityLevelConfigurations' concurrency
-  shares), broken down by the label `priority_level`.
+* `apiserver_flowcontrol_request_concurrency_limit` — gauge-вектор, содержащий вычисленный лимит параллелизма (основанный на общем лимите параллелизма сервера API и долях параллелизма PriorityLevelConfigurations), с разбивкой по лейблу `priority_level`. 
 
-* `apiserver_flowcontrol_request_wait_duration_seconds` is a histogram
-  vector of how long requests spent queued, broken down by the labels
-  `flow_schema` (indicating which one matched the request),
-  `priority_level` (indicating the one to which the request was
-  assigned), and `execute` (indicating whether the request started
-  executing).
+* `apiserver_flowcontrol_request_wait_duration_seconds` — вектор-гистограмма времени ожидания запросов в очереди с разбивкой по лейблам `flow_schema` (указывает, какая схема соответствует запросу), `priority_level` (указывает, к какому уровеню был отнесен запрос) и `execute` (указывает, начал ли запрос выполняться).
 
   {{< note >}}
-  Since each FlowSchema always assigns requests to a single
-  PriorityLevelConfiguration, you can add the histograms for all the
-  FlowSchemas for one priority level to get the effective histogram for
-  requests assigned to that priority level.
+  Поскольку каждая FlowSchema всегда относит запросы к одному PriorityLevelConfiguration, можно сложить гистограммы для всех FlowSchema для одного уровня приоритета, чтобы получить эффективную гистограмму для запросов, отнесенных к этому уровню приоритета. 
   {{< /note >}}
 
-* `apiserver_flowcontrol_request_execution_seconds` is a histogram
-  vector of how long requests took to actually execute, broken down by
-  the labels `flow_schema` (indicating which one matched the request)
-  and `priority_level` (indicating the one to which the request was
-  assigned).
+* `apiserver_flowcontrol_request_execution_seconds` — вектор-гистограмма времени, затраченного на выполнение запросов, с разбивкой по по лейблам `flow_schema` (указывает, какая схема соответствует запросу) и `priority_level` (указывает, к какому уровню был отнесен запрос).
 
-* `apiserver_flowcontrol_watch_count_samples` is a histogram vector of
-  the number of active WATCH requests relevant to a given write,
-  broken down by `flow_schema` and `priority_level`.
+* `apiserver_flowcontrol_watch_count_samples` — вектор-гистограмма количества активных запросов WATCH, относящихся к данной записи, с разбивкой по `flow_schema` и `priority_level`.
 
-* `apiserver_flowcontrol_work_estimated_seats` is a histogram vector
-  of the number of estimated seats (maximum of initial and final stage
-  of execution) associated with requests, broken down by `flow_schema`
-  and `priority_level`.
+* `apiserver_flowcontrol_work_estimated_seats` — вектор-гистограмма количества предполагаемых мест (максимум начального и конечного этапа выполнения), связанных с запросами, с разбивкой по `flow_schema` и `priority_level`.
 
-* `apiserver_flowcontrol_request_dispatch_no_accommodation_total` is a
-  counter vec of the number of events that in principle could have led
-  to a request being dispatched but did not, due to lack of available
-  concurrency, broken down by `flow_schema` and `priority_level`.  The
-  relevant sorts of events are arrival of a request and completion of
-  a request.
+* `apiserver_flowcontrol_request_dispatch_no_accommodation_total`  — вектор-счетчик количества событий, которые в принципе могли бы привести к отправке запроса, но не привели из-за отсутствия доступного параллелизма, с разбивкой по `flow_schema` и `priority_level`.  Соответствующими событиями являются поступление запроса и завершение запроса.
 
-### Debug endpoints
+### Отладочные endpoint'ы
 
-When you enable the API Priority and Fairness feature, the `kube-apiserver`
-serves the following additional paths at its HTTP[S] ports.
+При включении функции API Priority and Fairness feature `kube-apiserver`
+предоставляет следующие дополнительные пути на своих HTTP[S]-портах.
 
-- `/debug/api_priority_and_fairness/dump_priority_levels` - a listing of
-  all the priority levels and the current state of each.  You can fetch like this:
+- `/debug/api_priority_and_fairness/dump_priority_levels` — список всех уровней приоритета и текущее состояние каждого из них. Получить его можно следующим образом:
 
   ```shell
   kubectl get --raw /debug/api_priority_and_fairness/dump_priority_levels
   ```
 
-  The output is similar to this:
+  Вывод выглядит примерно так:
 
   ```none
   PriorityLevelName, ActiveQueues, IsIdle, IsQuiescing, WaitingRequests, ExecutingRequests,
@@ -418,14 +276,13 @@ serves the following additional paths at its HTTP[S] ports.
   workload-high,     0,            true,   false,       0,               0,
   ```
 
-- `/debug/api_priority_and_fairness/dump_queues` - a listing of all the
-  queues and their current state.  You can fetch like this:
+- `/debug/api_priority_and_fairness/dump_queues` — список всех очередей и их текущее состояние. Получить его можно следующим образом:
 
   ```shell
   kubectl get --raw /debug/api_priority_and_fairness/dump_queues
   ```
 
-  The output is similar to this:
+  Вывод выглядит примерно так:
 
   ```none
   PriorityLevelName, Index,  PendingRequests, ExecutingRequests, VirtualStart,
@@ -437,14 +294,13 @@ serves the following additional paths at its HTTP[S] ports.
   leader-election,   15,     0,               0,                 0.0000,
   ```
 
-- `/debug/api_priority_and_fairness/dump_requests` - a listing of all the requests
-  that are currently waiting in a queue.  You can fetch like this:
+- `/debug/api_priority_and_fairness/dump_requests` — список всех запросов, которые в настоящее время ожидают в очереди. Получить его можно следующим образом:
 
   ```shell
   kubectl get --raw /debug/api_priority_and_fairness/dump_requests
   ```
 
-  The output is similar to this:
+  Вывод выглядит примерно так:
 
   ```none
   PriorityLevelName, FlowSchemaName, QueueIndex, RequestIndexInQueue, FlowDistingsher,       ArriveTime,
@@ -452,16 +308,15 @@ serves the following additional paths at its HTTP[S] ports.
   system,            system-nodes,   12,         0,                   system:node:127.0.0.1, 2020-07-23T15:26:57.179170694Z,
   ```
   
-  In addition to the queued requests, the output includes one phantom line
-  for each priority level that is exempt from limitation.
+  В дополнение к запросам, стоящим в очереди, вывод включает одну фантомную строку для каждого уровня приоритета, на которую не распространяется ограничение.
 
-  You can get a more detailed listing with a command like this:
+  Более подробный список можно получить с помощью следующей команды:
 
   ```shell
   kubectl get --raw '/debug/api_priority_and_fairness/dump_requests?includeRequestDetails=1'
   ```
 
-  The output is similar to this:
+  Вывод выглядит примерно так:
 
   ```none
   PriorityLevelName, FlowSchemaName, QueueIndex, RequestIndexInQueue, FlowDistingsher,       ArriveTime,                     UserName,              Verb,   APIPath,                                                     Namespace, Name,   APIVersion, Resource, SubResource,
@@ -472,7 +327,4 @@ serves the following additional paths at its HTTP[S] ports.
 ## {{% heading "whatsnext" %}}
 
 
-For background information on design details for API priority and fairness, see
-the [enhancement proposal](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/1040-priority-and-fairness).
-You can make suggestions and feature requests via [SIG API Machinery](https://github.com/kubernetes/community/tree/master/sig-api-machinery) 
-or the feature's [slack channel](https://kubernetes.slack.com/messages/api-priority-and-fairness).
+Для получения подробной информации о функции API priority и fairness см. [предложение по улучшению (KEP)](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/1040-priority-and-fairness). Предложения и запросы функционала принимаются через [SIG API Machinery](https://github.com/kubernetes/community/tree/master/sig-api-machinery) или в специализированном [канале Slack](https://kubernetes.slack.com/messages/api-priority-and-fairness).
